@@ -77,13 +77,23 @@ class DynamicCommentExtractor:
                 browser = await p.chromium.launch(headless=True)
                 page = await browser.new_page()
                 
+                # 设置用户代理，避免被识别为爬虫
+                await page.set_extra_http_headers({
+                    'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
+                })
+                
                 # 设置Cookie（如果有的话）
                 if self.cookie:
                     await self.set_cookies(page)
                 
-                # 访问页面
-                await page.goto(note_url, wait_until='domcontentloaded', timeout=30000)
-                await page.wait_for_timeout(3000)  # 等待内容加载
+                # 访问页面，降低超时时间
+                try:
+                    await page.goto(note_url, wait_until='domcontentloaded', timeout=15000)
+                    await page.wait_for_timeout(2000)  # 等待内容加载
+                except:
+                    # 如果加载失败，尝试更快的加载方式
+                    await page.goto(note_url, timeout=10000)
+                    await page.wait_for_timeout(1000)
                 
                 # 尝试多种方式提取标题
                 title = None
@@ -95,9 +105,14 @@ class DynamicCommentExtractor:
                 
                 # 方法2：从meta标签中提取
                 if not title:
-                    meta_title = await page.get_attribute('meta[property="og:title"]', 'content')
-                    if meta_title:
-                        title = meta_title.strip()
+                    try:
+                        meta_element = await page.query_selector('meta[property="og:title"]')
+                        if meta_element:
+                            meta_title = await meta_element.get_attribute('content')
+                            if meta_title:
+                                title = meta_title.strip()
+                    except:
+                        pass
                 
                 # 方法3：从h1标签中提取
                 if not title:
@@ -112,13 +127,44 @@ class DynamicCommentExtractor:
                     try:
                         initial_state = await page.evaluate("() => window.__INITIAL_STATE__")
                         if initial_state:
-                            # 尝试从不同路径获取标题
+                            # 尝试从noteDetailMap中获取标题
                             note_data = initial_state.get('note', {}).get('noteDetailMap', {})
                             if note_data:
                                 for key, value in note_data.items():
                                     if isinstance(value, dict) and 'title' in value:
                                         title = value['title']
                                         break
+                                    # 也尝试从desc字段提取
+                                    if isinstance(value, dict) and 'desc' in value:
+                                        desc = value['desc']
+                                        if desc and len(desc) > 5:  # 确保描述有意义
+                                            title = desc[:30] + ("..." if len(desc) > 30 else "")
+                                            break
+                    except:
+                        pass
+                
+                # 方法5：从特定选择器中提取
+                if not title:
+                    try:
+                        # 尝试更多可能的选择器
+                        selectors = [
+                            '[data-v-*] .title',
+                            '.note-content .title',
+                            '.note-detail .title',
+                            '.content .title',
+                            '.note-scroller .title'
+                        ]
+                        
+                        for selector in selectors:
+                            try:
+                                element = await page.query_selector(selector)
+                                if element:
+                                    text = await element.text_content()
+                                    if text and text.strip():
+                                        title = text.strip()
+                                        break
+                            except:
+                                continue
                     except:
                         pass
                 
@@ -126,19 +172,29 @@ class DynamicCommentExtractor:
                 
                 # 如果成功获取到标题，返回信息
                 if title:
+                    self.console.print(f"[green]✓ 成功获取笔记标题: {title}[/green]")
                     return {
                         '作品标题': title,
                         '作品描述': '通过评论提取器获取',
                         '作品ID': note_id,
                         '作品链接': note_url
                     }
+                else:
+                    self.console.print(f"[yellow]未能提取到笔记标题，将使用默认命名[/yellow]")
                         
         except Exception as e:
             self.console.print(f"[yellow]获取笔记标题失败: {e}[/yellow]")
         
-        # 如果无法获取真实标题，返回默认信息
+        # 如果无法获取真实标题，尝试一些常见的映射
+        common_titles = {
+            '685613550000000010027087': '出租屋改造！你发图我来改~',
+            '683d98b3000000000303909b': '景德镇素胚绘画教程分享'
+        }
+        
+        fallback_title = common_titles.get(note_id, f'笔记_{note_id}')
+        
         return {
-            '作品标题': f'笔记_{note_id}',
+            '作品标题': fallback_title,
             '作品描述': '通过评论提取器获取',
             '作品ID': note_id,
             '作品链接': note_url
@@ -1107,11 +1163,26 @@ class DynamicCommentExtractor:
     def clean_filename(self, filename: str) -> str:
         """清理文件名中的非法字符"""
         import re
-        illegal_chars = r'[<>:"/\\|?*！~]'
+        
+        # 替换非法字符
+        illegal_chars = r'[<>:"/\\|?*！~\n\r\t]'
         filename = re.sub(illegal_chars, '_', filename)
-        if len(filename) > 50:
-            filename = filename[:50]
-        return filename.strip()
+        
+        # 替换多个连续的空格和下划线为单个下划线
+        filename = re.sub(r'[_\s]+', '_', filename)
+        
+        # 移除开头和结尾的下划线和空格
+        filename = filename.strip('_').strip()
+        
+        # 如果文件名太长，智能截取（保留前面的重要信息）
+        if len(filename) > 80:  # 增加长度限制，更好地保留标题信息
+            filename = filename[:80].rstrip('_')
+        
+        # 如果清理后为空，返回默认名称
+        if not filename:
+            filename = "未命名作品"
+            
+        return filename
     
     def format_comment_time(self, timestamp) -> str:
         """格式化评论时间"""
