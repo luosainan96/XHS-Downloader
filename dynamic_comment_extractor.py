@@ -21,18 +21,26 @@ from playwright.async_api import async_playwright
 from rich.console import Console
 from rich.progress import Progress, TextColumn, BarColumn, TimeRemainingColumn
 
-from source import XHS
+# from source import XHS  # 注释掉原有依赖，使评论提取器独立运行
 
 
 class DynamicCommentExtractor:
     """动态评论提取器"""
     
-    def __init__(self, work_path: str = "Comments", cookie: str = "", use_persistent_session: bool = True):
-        """初始化评论提取器"""
+    def __init__(self, work_path: str = "Comments", cookie: str = "", use_persistent_session: bool = True, max_comments: int = None):
+        """初始化评论提取器
+        
+        Args:
+            work_path: 工作目录路径
+            cookie: 登录Cookie
+            use_persistent_session: 是否使用持久化会话
+            max_comments: 最大评论数量限制，None表示不限制
+        """
         self.work_path = Path(work_path)
         self.cookie = cookie
         self.console = Console()
         self.use_persistent_session = use_persistent_session
+        self.max_comments = max_comments
         
         # 创建工作目录
         self.work_path.mkdir(exist_ok=True)
@@ -58,15 +66,83 @@ class DynamicCommentExtractor:
         return None
     
     async def get_note_info_with_xhs(self, note_url: str) -> Optional[Dict]:
-        """使用XHS-Downloader获取笔记信息"""
+        """从页面中提取真实的笔记信息"""
+        note_id = self.extract_note_id(note_url)
+        if not note_id:
+            return None
+            
+        # 从浏览器中获取真实的笔记标题
         try:
-            async with XHS(cookie=self.cookie) as xhs:
-                result = await xhs.extract(note_url, download=False)
-                if result and len(result) > 0:
-                    return result[0]
+            async with async_playwright() as p:
+                browser = await p.chromium.launch(headless=True)
+                page = await browser.new_page()
+                
+                # 设置Cookie（如果有的话）
+                if self.cookie:
+                    await self.set_cookies(page)
+                
+                # 访问页面
+                await page.goto(note_url, wait_until='domcontentloaded', timeout=30000)
+                await page.wait_for_timeout(3000)  # 等待内容加载
+                
+                # 尝试多种方式提取标题
+                title = None
+                
+                # 方法1：从页面标题中提取
+                page_title = await page.title()
+                if page_title and page_title != "小红书" and page_title != "安全限制":
+                    title = page_title.replace(" - 小红书", "").strip()
+                
+                # 方法2：从meta标签中提取
+                if not title:
+                    meta_title = await page.get_attribute('meta[property="og:title"]', 'content')
+                    if meta_title:
+                        title = meta_title.strip()
+                
+                # 方法3：从h1标签中提取
+                if not title:
+                    h1_element = await page.query_selector('h1')
+                    if h1_element:
+                        title = await h1_element.text_content()
+                        if title:
+                            title = title.strip()
+                
+                # 方法4：从JSON数据中提取
+                if not title:
+                    try:
+                        initial_state = await page.evaluate("() => window.__INITIAL_STATE__")
+                        if initial_state:
+                            # 尝试从不同路径获取标题
+                            note_data = initial_state.get('note', {}).get('noteDetailMap', {})
+                            if note_data:
+                                for key, value in note_data.items():
+                                    if isinstance(value, dict) and 'title' in value:
+                                        title = value['title']
+                                        break
+                    except:
+                        pass
+                
+                await browser.close()
+                
+                # 如果成功获取到标题，返回信息
+                if title:
+                    return {
+                        '作品标题': title,
+                        '作品描述': '通过评论提取器获取',
+                        '作品ID': note_id,
+                        '作品链接': note_url
+                    }
+                        
         except Exception as e:
-            self.console.print(f"[red]XHS获取笔记信息失败: {e}[/red]")
-        return None
+            self.console.print(f"[yellow]获取笔记标题失败: {e}[/yellow]")
+        
+        # 如果无法获取真实标题，返回默认信息
+        return {
+            '作品标题': f'笔记_{note_id}',
+            '作品描述': '通过评论提取器获取',
+            '作品ID': note_id,
+            '作品链接': note_url
+        }
     
     async def extract_comments_with_browser(self, note_url: str, note_id: str) -> List[Dict]:
         """使用浏览器自动化提取动态评论"""
@@ -236,7 +312,10 @@ class DynamicCommentExtractor:
         page_count = 0
         max_pages = 20  # 最大页数限制，防止无限循环 (最多200条评论)
         
-        self.console.print("[blue]开始分页获取所有评论...[/blue]")
+        if self.max_comments:
+            self.console.print(f"[blue]开始分页获取最新 {self.max_comments} 条评论...[/blue]")
+        else:
+            self.console.print("[blue]开始分页获取所有评论...[/blue]")
         
         while page_count < max_pages:
             page_count += 1
@@ -270,8 +349,20 @@ class DynamicCommentExtractor:
                     new_comments = [c for c in current_comments if c.get('id', '') not in existing_ids]
                     
                     if new_comments:
+                        # 检查是否超过数量限制
+                        if self.max_comments and len(all_comments) + len(new_comments) > self.max_comments:
+                            # 只取需要的数量
+                            needed_count = self.max_comments - len(all_comments)
+                            new_comments = new_comments[:needed_count]
+                            self.console.print(f"[yellow]已达到数量限制，只取前 {needed_count} 条评论[/yellow]")
+                        
                         all_comments.extend(new_comments)
                         self.console.print(f"[green]第 {page_count} 页获取到 {len(new_comments)} 条新评论（总计 {len(all_comments)} 条）[/green]")
+                        
+                        # 检查是否已达到数量限制
+                        if self.max_comments and len(all_comments) >= self.max_comments:
+                            self.console.print(f"[green]已获取到指定数量的评论：{len(all_comments)} 条[/green]")
+                            break
                     else:
                         self.console.print(f"[yellow]第 {page_count} 页没有新评论，可能已获取完毕[/yellow]")
                         break
@@ -478,6 +569,22 @@ class DynamicCommentExtractor:
         except Exception as e:
             self.console.print(f"[yellow]登录状态检查失败: {e}[/yellow]")
             return True
+    
+    async def set_cookies(self, page):
+        """设置Cookie到页面"""
+        if not self.cookie:
+            return
+        
+        try:
+            # 先访问主页面设置域名上下文
+            await page.goto("https://www.xiaohongshu.com", wait_until='domcontentloaded', timeout=15000)
+            
+            # 解析并设置Cookie
+            cookies = self.parse_cookie_string(self.cookie)
+            await page.context.add_cookies(cookies)
+            
+        except Exception as e:
+            self.console.print(f"[yellow]设置Cookie失败: {e}[/yellow]")
     
     def parse_cookie_string(self, cookie_string: str) -> List[Dict]:
         """解析Cookie字符串为Playwright格式"""
@@ -748,16 +855,19 @@ class DynamicCommentExtractor:
             # 简化时间格式，去掉秒和特殊字符
             time_part = formatted_time.replace(':', '-').replace(' ', '_')
             
-            # 截取评论内容的前20个字符并清理
-            content_part = content[:20] if content else "无内容"
+            # 截取评论内容的前50个字符并清理（保留更多内容用于文件名）
+            content_part = content[:50] if content else "无内容"
             content_part = self.clean_filename(content_part)
+            
+            # 如果内容被截断，添加省略号标识
+            if content and len(content) > 50:
+                content_part += "..."
             
             # 组合文件名
             filename = f"{clean_nickname}_{time_part}_{content_part}"
             
-            # 添加序号
-            if index > 1:
-                filename += f"_{index}"
+            # 添加序号（确保每张图片都有唯一标识）
+            filename += f"_{index}"
             
             return filename
         except Exception as e:
@@ -802,16 +912,15 @@ class DynamicCommentExtractor:
         except:
             return '.jpg'
     
-    async def download_comment_images(self, images: List, nickname: str, formatted_time: str, content: str, comment_dir: Path) -> List[str]:
+    async def download_comment_images(self, image_urls: List[str], nickname: str, formatted_time: str, content: str, comment_dir: Path) -> List[str]:
         """下载评论中的所有图片"""
         downloaded_images = []
         
-        if not images:
+        if not image_urls:
             return downloaded_images
         
-        # 创建图片子目录
-        images_dir = comment_dir / "images"
-        images_dir.mkdir(exist_ok=True)
+        # 直接使用用户昵称目录，不创建images子目录
+        images_dir = comment_dir
         
         # 创建HTTP会话
         headers = {
@@ -820,15 +929,8 @@ class DynamicCommentExtractor:
         }
         
         async with aiohttp.ClientSession(headers=headers) as session:
-            for i, img in enumerate(images, 1):
+            for i, url in enumerate(image_urls, 1):
                 try:
-                    # 获取图片URL
-                    if isinstance(img, dict):
-                        # 尝试多个可能的URL字段
-                        url = img.get('url_default', img.get('url', img.get('src', img.get('urlDefault', ''))))
-                    else:
-                        url = str(img)
-                    
                     if not url:
                         continue
                     
@@ -843,7 +945,7 @@ class DynamicCommentExtractor:
                     save_path = images_dir / filename
                     
                     # 下载图片
-                    self.console.print(f"[blue]下载图片 {i}/{len(images)}: {filename}[/blue]")
+                    self.console.print(f"[blue]下载图片 {i}/{len(image_urls)}: {filename}[/blue]")
                     success = await self.download_image(url, save_path, session)
                     
                     if success:
@@ -1092,7 +1194,7 @@ IP位置: {ip_location}
                 if image_urls:
                     # 下载评论图片
                     self.console.print(f"[blue]开始下载 {len(image_urls)} 张评论图片...[/blue]")
-                    downloaded_images = await self.download_comment_images(images, nickname, formatted_time, content, comment_dir)
+                    downloaded_images = await self.download_comment_images(image_urls, nickname, formatted_time, content, comment_dir)
                     
                     # 在文本中记录图片信息
                     comment_info += f"\n评论图片 (共{len(image_urls)}张):\n"
@@ -1129,6 +1231,10 @@ IP位置: {ip_location}
                 return False
             
             self.console.print(f"[blue]开始处理笔记: {note_id}[/blue]")
+            if self.max_comments:
+                self.console.print(f"[yellow]数量限制: 只获取最新 {self.max_comments} 条评论[/yellow]")
+            else:
+                self.console.print("[blue]将获取所有可用评论[/blue]")
             
             # 获取笔记信息
             note_info = await self.get_note_info_with_xhs(note_url)
@@ -1180,6 +1286,10 @@ IP位置: {ip_location}
             
             self.console.print(f"[green]成功获取到 {len(normalized_comments)} 条评论[/green]")
             
+            # 按时间排序评论（最新的在前面）
+            normalized_comments.sort(key=lambda x: x.get('create_time', 0), reverse=True)
+            self.console.print("[blue]✓ 评论已按时间排序（最新在前）[/blue]")
+            
             # 保存评论
             with Progress(
                 TextColumn("[progress.description]{task.description}"),
@@ -1219,15 +1329,18 @@ IP位置: {ip_location}
 作品标题: {work_title}
 提取时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 评论数量: {len(normalized_comments)} 条
+排序方式: 按时间倒序（最新评论在前）
 
 技术方法:
 - 使用Playwright浏览器自动化
 - 模拟真实浏览器访问
 - 动态触发JavaScript评论加载
 - 从__INITIAL_STATE__和DOM中提取数据
+- 按时间排序避免重复下载
 
 说明:
 此版本使用浏览器自动化技术，可以处理动态加载的评论。
+评论按时间倒序排列，最新的评论在前面，避免重复下载。
 如果未获取到真实评论，可能需要登录状态或该笔记暂无评论。
 """
             
