@@ -27,7 +27,7 @@ from rich.progress import Progress, TextColumn, BarColumn, TimeRemainingColumn
 class DynamicCommentExtractor:
     """动态评论提取器"""
     
-    def __init__(self, work_path: str = "Comments", cookie: str = "", use_persistent_session: bool = True, max_comments: int = None):
+    def __init__(self, work_path: str = "Comments", cookie: str = "", use_persistent_session: bool = True, max_comments: int = None, progress_callback=None):
         """初始化评论提取器
         
         Args:
@@ -35,12 +35,14 @@ class DynamicCommentExtractor:
             cookie: 登录Cookie
             use_persistent_session: 是否使用持久化会话
             max_comments: 最大评论数量限制，None表示不限制
+            progress_callback: 进度回调函数
         """
         self.work_path = Path(work_path)
         self.cookie = cookie
         self.console = Console()
         self.use_persistent_session = use_persistent_session
         self.max_comments = max_comments
+        self.progress_callback = progress_callback
         
         # 创建工作目录
         self.work_path.mkdir(exist_ok=True)
@@ -100,8 +102,13 @@ class DynamicCommentExtractor:
                 
                 # 方法1：从页面标题中提取
                 page_title = await page.title()
+                
                 if page_title and page_title != "小红书" and page_title != "安全限制":
                     title = page_title.replace(" - 小红书", "").strip()
+                    # 过滤掉通用的页面标题
+                    invalid_titles = ["你的生活兴趣社区", "小红书_-_你的生活兴趣社区", "小红书", "你访问的页面不见了"]
+                    if title in invalid_titles or "你访问的页面不见了" in title:
+                        title = None
                 
                 # 方法2：从meta标签中提取
                 if not title:
@@ -131,15 +138,32 @@ class DynamicCommentExtractor:
                             note_data = initial_state.get('note', {}).get('noteDetailMap', {})
                             if note_data:
                                 for key, value in note_data.items():
-                                    if isinstance(value, dict) and 'title' in value:
-                                        title = value['title']
-                                        break
-                                    # 也尝试从desc字段提取
-                                    if isinstance(value, dict) and 'desc' in value:
-                                        desc = value['desc']
-                                        if desc and len(desc) > 5:  # 确保描述有意义
-                                            title = desc[:30] + ("..." if len(desc) > 30 else "")
-                                            break
+                                    if isinstance(value, dict):
+                                        # 首先尝试title字段
+                                        if 'title' in value and value['title']:
+                                            candidate_title = value['title'].strip()
+                                            if candidate_title and candidate_title not in ["小红书", "你的生活兴趣社区"]:
+                                                title = candidate_title
+                                                break
+                                        # 然后尝试desc字段
+                                        if 'desc' in value and value['desc']:
+                                            desc = value['desc'].strip()
+                                            if desc and len(desc) > 5 and desc not in ["小红书", "你的生活兴趣社区"]:
+                                                title = desc[:30] + ("..." if len(desc) > 30 else "")
+                                                break
+                                        # 尝试从note字段中提取
+                                        if 'note' in value and isinstance(value['note'], dict):
+                                            note_info = value['note']
+                                            if 'title' in note_info and note_info['title']:
+                                                candidate_title = note_info['title'].strip()
+                                                if candidate_title and candidate_title not in ["小红书", "你的生活兴趣社区"]:
+                                                    title = candidate_title
+                                                    break
+                                            if 'desc' in note_info and note_info['desc']:
+                                                desc = note_info['desc'].strip()
+                                                if desc and len(desc) > 5 and desc not in ["小红书", "你的生活兴趣社区"]:
+                                                    title = desc[:30] + ("..." if len(desc) > 30 else "")
+                                                    break
                     except:
                         pass
                 
@@ -170,8 +194,8 @@ class DynamicCommentExtractor:
                 
                 await browser.close()
                 
-                # 如果成功获取到标题，返回信息
-                if title:
+                # 如果成功获取到标题，验证是否有效
+                if title and title not in ["小红书", "你的生活兴趣社区", "小红书_-_你的生活兴趣社区"]:
                     self.console.print(f"[green]✓ 成功获取笔记标题: {title}[/green]")
                     return {
                         '作品标题': title,
@@ -180,7 +204,7 @@ class DynamicCommentExtractor:
                         '作品链接': note_url
                     }
                 else:
-                    self.console.print(f"[yellow]未能提取到笔记标题，将使用默认命名[/yellow]")
+                    self.console.print(f"[yellow]未能提取到有效笔记标题，将使用预设映射[/yellow]")
                         
         except Exception as e:
             self.console.print(f"[yellow]获取笔记标题失败: {e}[/yellow]")
@@ -188,10 +212,13 @@ class DynamicCommentExtractor:
         # 如果无法获取真实标题，尝试一些常见的映射
         common_titles = {
             '685613550000000010027087': '出租屋改造！你发图我来改~',
-            '683d98b3000000000303909b': '景德镇素胚绘画教程分享'
+            '683d98b3000000000303909b': '景德镇素胚绘画教程分享',
+            # 可以根据需要添加更多笔记ID映射
         }
         
         fallback_title = common_titles.get(note_id, f'笔记_{note_id}')
+        
+        self.console.print(f"[blue]使用预设标题: {fallback_title}[/blue]")
         
         return {
             '作品标题': fallback_title,
@@ -1306,6 +1333,38 @@ IP位置: {ip_location}
             json_file = comment_dir / "原始数据.json"
             async with aiofiles.open(json_file, 'w', encoding='utf-8') as f:
                 await f.write(json.dumps(clean_comment, ensure_ascii=False, indent=2))
+            
+            # 调用进度回调函数
+            if self.progress_callback:
+                try:
+                    image_urls = []
+                    if images:
+                        for img in images:
+                            if isinstance(img, dict):
+                                url = img.get('url_default', img.get('url', img.get('src', img.get('urlDefault', ''))))
+                            else:
+                                url = str(img)
+                            if url:
+                                image_urls.append(url)
+                    
+                    self.console.print(f"[blue]调用进度回调函数: {nickname} - {content[:30]}...[/blue]")
+                    
+                    # 传递下载后的图片路径和原始URL
+                    callback_data = {
+                        'nickname': nickname,
+                        'time': formatted_time,
+                        'content': content,
+                        'image_urls': image_urls,
+                        'downloaded_images': downloaded_images if 'downloaded_images' in locals() else [],
+                        'comment_dir': str(comment_dir)
+                    }
+                    
+                    self.progress_callback(callback_data)
+                    self.console.print(f"[green]回调函数调用成功[/green]")
+                except Exception as callback_error:
+                    self.console.print(f"[yellow]回调函数执行失败: {callback_error}[/yellow]")
+            else:
+                self.console.print(f"[yellow]没有设置进度回调函数[/yellow]")
                 
         except Exception as e:
             self.console.print(f"[red]保存评论内容失败: {e}[/red]")
