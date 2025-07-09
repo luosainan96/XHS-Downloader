@@ -978,6 +978,10 @@ class DynamicCommentExtractor:
         # 直接使用用户昵称目录，不创建images子目录
         images_dir = comment_dir
         
+        # 创建统一的图片收集目录
+        all_images_dir = self.work_path / "all_comment_images"
+        all_images_dir.mkdir(exist_ok=True)
+        
         # 创建HTTP会话
         headers = {
             'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
@@ -997,16 +1001,30 @@ class DynamicCommentExtractor:
                     extension = self.get_image_extension(url)
                     filename = filename_base + extension
                     
-                    # 完整的保存路径
-                    save_path = images_dir / filename
+                    # 用户文件夹中的保存路径
+                    user_save_path = images_dir / filename
+                    
+                    # 统一收集目录中的保存路径
+                    all_save_path = all_images_dir / filename
                     
                     # 下载图片
                     self.console.print(f"[blue]下载图片 {i}/{len(image_urls)}: {filename}[/blue]")
-                    success = await self.download_image(url, save_path, session)
+                    
+                    # 先下载到用户文件夹
+                    success = await self.download_image(url, user_save_path, session)
                     
                     if success:
-                        downloaded_images.append(str(save_path))
-                        self.console.print(f"[green]✓ 图片下载成功: {filename}[/green]")
+                        downloaded_images.append(str(user_save_path))
+                        
+                        # 复制到统一收集目录
+                        try:
+                            import shutil
+                            shutil.copy2(user_save_path, all_save_path)
+                            self.console.print(f"[green]✓ 图片下载成功: {filename}[/green]")
+                            self.console.print(f"[cyan]  └─ 已同步到统一目录: all_comment_images/{filename}[/cyan]")
+                        except Exception as copy_error:
+                            self.console.print(f"[yellow]⚠️  复制到统一目录失败: {copy_error}[/yellow]")
+                            
                     else:
                         self.console.print(f"[red]✗ 图片下载失败: {filename}[/red]")
                         
