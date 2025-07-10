@@ -16,6 +16,7 @@ import re
 import pandas as pd
 
 from dynamic_comment_extractor import DynamicCommentExtractor
+from local_comment_loader import LocalCommentLoader
 import aiohttp
 import aiofiles
 import hashlib
@@ -192,7 +193,7 @@ def extract_note_id_simple(url: str) -> str:
         pass
     return "未知ID"
 
-def run_extraction_simple(urls: list, cookie: str, work_path: str, max_comments: int = None):
+def run_extraction_simple(urls: list, cookie: str, work_path: str, max_comments: int = None, auto_cookie_enabled: bool = False):
     """简化的提取函数，直接在主线程中运行"""
     try:
         st.session_state.extraction_status = 'running'
@@ -243,7 +244,8 @@ def run_extraction_simple(urls: list, cookie: str, work_path: str, max_comments:
                 cookie=cookie,
                 use_persistent_session=True,
                 max_comments=max_comments,
-                progress_callback=progress_callback
+                progress_callback=progress_callback,
+                auto_cookie=auto_cookie_enabled
             )
             
             total_urls = len(urls)
@@ -320,14 +322,75 @@ def main():
     with st.sidebar:
         st.header("⚙️ 配置设置")
         
-        # Cookie输入
+        # Cookie设置
         st.subheader("1. Cookie设置")
-        cookie_input = st.text_area(
-            "请输入小红书Cookie:",
-            height=100,
-            help="用于登录验证，可在浏览器开发者工具中获取",
-            placeholder="a1=xxx; web_session=xxx; ..."
+        
+        # Cookie获取方式选择
+        cookie_mode = st.radio(
+            "选择Cookie获取方式",
+            options=["🤖 自动获取Cookie (推荐)", "📝 手动输入Cookie"],
+            index=0,
+            help="自动获取模式会智能管理Cookie，推荐使用"
         )
+        
+        cookie_input = ""
+        auto_cookie_enabled = False
+        
+        if cookie_mode == "🤖 自动获取Cookie (推荐)":
+            auto_cookie_enabled = True
+            st.info("✨ 自动模式：程序将自动获取和管理Cookie，无需手动操作")
+            
+            # Cookie管理功能
+            col1, col2 = st.columns([1, 1])
+            with col1:
+                if st.button("🔍 检查Cookie状态", help="检查当前Cookie是否有效"):
+                    with st.spinner("正在检查Cookie状态..."):
+                        try:
+                            from cookie_manager import CookieManager
+                            import asyncio
+                            
+                            async def check_cookie_status():
+                                manager = CookieManager("Comments_Dynamic")
+                                cookie, is_new = await manager.get_cookie_automatically()
+                                return cookie, is_new
+                            
+                            cookie, is_new = asyncio.run(check_cookie_status())
+                            if cookie:
+                                st.success("✅ Cookie状态正常")
+                                if is_new:
+                                    st.info("🆕 获取到新Cookie")
+                                else:
+                                    st.info("💾 使用缓存Cookie")
+                                # 设置cookie_input以便后续使用
+                                st.session_state['auto_cookie'] = cookie
+                            else:
+                                st.error("❌ 无法获取有效Cookie，建议使用手动模式")
+                        except Exception as e:
+                            st.error(f"Cookie检查失败: {e}")
+            
+            with col2:
+                if st.button("🗑️ 清理Cookie缓存", help="清理保存的Cookie缓存"):
+                    try:
+                        from cookie_manager import CookieManager
+                        manager = CookieManager("Comments_Dynamic")
+                        manager.clear_cache()
+                        st.success("✅ Cookie缓存已清理")
+                        if 'auto_cookie' in st.session_state:
+                            del st.session_state['auto_cookie']
+                    except Exception as e:
+                        st.error(f"清理失败: {e}")
+            
+            # 在自动模式下，使用临时cookie_input
+            cookie_input = "auto_mode"
+        
+        else:
+            st.info("📝 手动模式：请从浏览器复制Cookie")
+            cookie_input = st.text_area(
+                "请输入小红书Cookie:",
+                height=100,
+                help="用于登录验证，可在浏览器开发者工具中获取",
+                placeholder="a1=xxx; web_session=xxx; ..."
+            )
         
         # 输出路径设置
         st.subheader("2. 输出设置")
@@ -366,7 +429,7 @@ def main():
         """)
     
     # 主内容区域 - 使用选项卡组织内容
-    tab1, tab2, tab3 = st.tabs(["📝 输入链接", "📊 提取状态", "📋 评论详情"])
+    tab1, tab2, tab3, tab4 = st.tabs(["📝 输入链接", "📊 提取状态", "📋 评论详情", "📂 本地浏览"])
     
     with tab1:
         st.header("📝 作品链接输入")
@@ -430,13 +493,13 @@ def main():
         # 检查是否可以开始
         can_start = (
             len(urls) > 0 and 
-            cookie_input.strip() and 
+            (cookie_input.strip() or auto_cookie_enabled) and 
             st.session_state.extraction_status not in ['running']
         )
         
         # 状态检查和错误提示
-        if not cookie_input.strip():
-            st.warning("⚠️ 请先输入Cookie!")
+        if not auto_cookie_enabled and not cookie_input.strip():
+            st.warning("⚠️ 请先输入Cookie或启用自动Cookie模式!")
         if not urls:
             st.warning("⚠️ 请先输入有效的作品链接!")
         
@@ -473,8 +536,10 @@ def main():
         elif st.session_state.extraction_status == 'starting':
             st.warning("🚀 正在启动...")
             # 在这里运行提取
-            if 'urls' in locals() and 'cookie_input' in locals() and urls and cookie_input.strip():
-                run_extraction_simple(urls, cookie_input.strip(), work_path, max_comments)
+            if 'urls' in locals() and urls and (cookie_input.strip() or auto_cookie_enabled):
+                # 传递自动Cookie模式标志
+                actual_cookie = cookie_input.strip() if not auto_cookie_enabled else ""
+                run_extraction_simple(urls, actual_cookie, work_path, max_comments, auto_cookie_enabled)
                 st.rerun()
             
         elif st.session_state.extraction_status == 'running':
@@ -854,6 +919,220 @@ def main():
                                 st.write("无图片")
         else:
             st.info("暂无评论数据，请先执行评论提取。")
+    
+    with tab4:
+        st.header("📂 本地评论浏览")
+        
+        # 初始化本地加载器
+        if 'local_loader' not in st.session_state:
+            st.session_state.local_loader = LocalCommentLoader("Comments_Dynamic")
+        
+        loader = st.session_state.local_loader
+        
+        # 扫描本地作品
+        col_refresh, col_info = st.columns([1, 3])
+        with col_refresh:
+            if st.button("🔄 刷新作品列表"):
+                works = loader.scan_available_works(force_refresh=True)
+                st.success(f"✅ 刷新完成，找到 {len(works)} 个作品")
+            else:
+                works = loader.scan_available_works()
+        
+        with col_info:
+            if works:
+                st.info(f"📊 共找到 {len(works)} 个本地作品，总计 {sum(w['comment_count'] for w in works)} 条评论")
+            else:
+                st.warning("⚠️ 未找到本地评论数据，请先执行评论提取")
+        
+        if works:
+            st.markdown("---")
+            
+            # 作品选择
+            st.subheader("🎯 选择作品")
+            
+            # 作品列表显示
+            work_options = []
+            for work in works:
+                option_text = f"{work['work_title']} ({work['comment_count']} 条评论)"
+                if work['latest_comment_time']:
+                    option_text += f" - 最新: {work['latest_comment_time']}"
+                work_options.append(option_text)
+            
+            selected_work_index = st.selectbox(
+                "选择要查看的作品",
+                range(len(works)),
+                format_func=lambda x: work_options[x],
+                key="local_work_selector"
+            )
+            
+            if selected_work_index is not None:
+                selected_work = works[selected_work_index]
+                
+                st.markdown("---")
+                
+                # 显示作品信息
+                st.subheader("📖 作品信息")
+                work_col1, work_col2 = st.columns([2, 1])
+                
+                with work_col1:
+                    st.write(f"**作品标题**: {selected_work['work_title']}")
+                    if selected_work['work_id']:
+                        st.write(f"**作品ID**: `{selected_work['work_id']}`")
+                    if selected_work['work_link']:
+                        st.write(f"**原始链接**: [点击访问]({selected_work['work_link']})")
+                
+                with work_col2:
+                    # 获取统计信息
+                    stats = loader.get_work_statistics(selected_work['work_dir'])
+                    
+                    col_s1, col_s2 = st.columns(2)
+                    with col_s1:
+                        st.metric("💬 评论数", stats['total_comments'])
+                        st.metric("📸 图片数", stats['total_images'])
+                    with col_s2:
+                        st.metric("🖼️ 有图评论", stats['comments_with_images'])
+                        st.metric("💾 已下载", stats['total_downloaded_images'])
+                
+                st.markdown("---")
+                
+                # 搜索和筛选
+                st.subheader("🔍 搜索和筛选")
+                search_col1, search_col2, search_col3 = st.columns([2, 1, 1])
+                
+                with search_col1:
+                    local_search_term = st.text_input(
+                        "搜索评论内容", 
+                        placeholder="输入关键词搜索...",
+                        key="local_search"
+                    )
+                
+                with search_col2:
+                    local_show_images_only = st.checkbox(
+                        "仅显示有图评论", 
+                        value=False,
+                        key="local_images_only"
+                    )
+                
+                with search_col3:
+                    if st.button("📊 导出摘要"):
+                        summary = loader.export_work_summary(selected_work['work_dir'])
+                        st.download_button(
+                            label="📥 下载摘要文件",
+                            data=summary,
+                            file_name=f"{selected_work['work_title']}_摘要.md",
+                            mime="text/markdown"
+                        )
+                
+                # 加载和显示评论
+                with st.spinner("正在加载评论数据..."):
+                    comments = loader.search_comments(
+                        selected_work['work_dir'],
+                        local_search_term,
+                        local_show_images_only
+                    )
+                
+                st.markdown("---")
+                
+                # 显示筛选结果
+                st.subheader("📋 评论列表")
+                st.write(f"显示 {len(comments)} / {stats['total_comments']} 条评论")
+                
+                if comments:
+                    # 评论汇总表格
+                    st.subheader("📊 评论汇总表格")
+                    
+                    table_data = []
+                    for i, comment in enumerate(comments):
+                        table_data.append({
+                            '序号': i + 1,
+                            '用户昵称': comment['nickname'],
+                            '评论时间': comment['time'],
+                            '评论内容': comment['content'][:50] + '...' if len(comment['content']) > 50 else comment['content'],
+                            '图片数量': len(comment.get('downloaded_images', [])),
+                        })
+                    
+                    df = pd.DataFrame(table_data)
+                    st.dataframe(df, use_container_width=True, height=400)
+                    
+                    st.markdown("---")
+                    
+                    # 评论详情展示
+                    st.subheader("🖼️ 评论详情展示")
+                    
+                    # 为每个评论创建详细展示
+                    for i, comment in enumerate(comments):
+                        # 确定评论的状态标识
+                        comment_dir = comment.get('comment_dir', '')
+                        image_urls = comment.get('images', [])
+                        status_indicator = ""
+                        
+                        if image_urls:
+                            # 检查是否有本地图片
+                            local_images_exist = False
+                            if comment_dir:
+                                comment_path = Path(comment_dir)
+                                if comment_path.exists():
+                                    local_files = list(comment_path.glob("*.jpg")) + list(comment_path.glob("*.png"))
+                                    if local_files:
+                                        local_images_exist = True
+                            
+                            if local_images_exist:
+                                status_indicator = "💾"  # 本地已有
+                            else:
+                                status_indicator = "📥"  # 需要下载
+                        else:
+                            status_indicator = "📝"  # 纯文本评论
+                        
+                        with st.expander(f"{status_indicator} 👤 {comment['nickname']} - {comment['time']}", expanded=False):
+                            # 使用两列布局
+                            detail_col1, detail_col2 = st.columns([3, 2])
+                            
+                            with detail_col1:
+                                st.write(f"**评论内容:**")
+                                st.write(comment['content'])
+                                
+                                # 显示原始图片URL
+                                if comment.get('images'):
+                                    st.write(f"**原始图片URL ({len(comment['images'])}张):**")
+                                    for idx, url in enumerate(comment['images'][:3]):
+                                        # 创建超链接
+                                        truncated_url = url[:60] + "..." if len(url) > 60 else url
+                                        st.markdown(f"🔗 [图片 {idx+1}: {truncated_url}]({url})")
+                                    if len(comment['images']) > 3:
+                                        st.text(f"... 还有 {len(comment['images']) - 3} 张图片")
+                            
+                            with detail_col2:
+                                # 显示已下载的图片
+                                downloaded_images = comment.get('downloaded_images', [])
+                                total_images = len(downloaded_images)
+                                st.write(f"**已下载图片:** {total_images} 张")
+                                
+                                if total_images > 0:
+                                    # 显示图片
+                                    for idx, img_path in enumerate(downloaded_images):
+                                        try:
+                                            img_file = Path(img_path)
+                                            if img_file.exists():
+                                                st.image(str(img_file), caption=f"图片 {idx+1}", width=250)
+                                            else:
+                                                st.text(f"图片 {idx+1}: {img_file.name}")
+                                                st.caption(f"路径: {img_path}")
+                                        except Exception as e:
+                                            st.text(f"图片 {idx+1}: 显示失败")
+                                            st.caption(f"错误: {str(e)}")
+                                        
+                                        # 只显示前3张图片
+                                        if idx >= 2:
+                                            if total_images > 3:
+                                                st.text(f"... 还有 {total_images - 3} 张图片")
+                                            break
+                                else:
+                                    st.write("无图片")
+                else:
+                    st.info("🔍 没有找到匹配的评论，请尝试调整搜索条件")
+        
+        else:
+            st.info("📂 暂无本地评论数据，请先在'📝 输入链接'选项卡中提取评论")
     
     # 结果显示
     if st.session_state.results:
