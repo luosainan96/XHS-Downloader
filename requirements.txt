@@ -24,3 +24,13 @@ textual==3.1.0
     # via xhs-downloader (pyproject.toml)
 uvicorn==0.34.2
     # via xhs-downloader (pyproject.toml)
+
+# Additional dependencies for optimization utilities
+psutil>=5.9.0
+    # for system monitoring and memory management
+streamlit>=1.28.0
+    # for web UI
+playwright>=1.40.0
+    # for browser automation
+rich>=13.0.0
+    # for console output formatting

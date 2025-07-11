@@ -21,21 +21,24 @@ from playwright.async_api import async_playwright
 from rich.console import Console
 from rich.progress import Progress, TextColumn, BarColumn, TimeRemainingColumn
 
+from cookie_manager import CookieManager
+
 # from source import XHS  # 注释掉原有依赖，使评论提取器独立运行
 
 
 class DynamicCommentExtractor:
     """动态评论提取器"""
     
-    def __init__(self, work_path: str = "Comments", cookie: str = "", use_persistent_session: bool = True, max_comments: int = None, progress_callback=None):
+    def __init__(self, work_path: str = "Comments", cookie: str = "", use_persistent_session: bool = True, max_comments: int = None, progress_callback=None, auto_cookie: bool = True):
         """初始化评论提取器
         
         Args:
             work_path: 工作目录路径
-            cookie: 登录Cookie
+            cookie: 登录Cookie (可选，如果启用auto_cookie)
             use_persistent_session: 是否使用持久化会话
             max_comments: 最大评论数量限制，None表示不限制
             progress_callback: 进度回调函数
+            auto_cookie: 是否启用自动Cookie获取
         """
         self.work_path = Path(work_path)
         self.cookie = cookie
@@ -43,15 +46,47 @@ class DynamicCommentExtractor:
         self.use_persistent_session = use_persistent_session
         self.max_comments = max_comments
         self.progress_callback = progress_callback
+        self.auto_cookie = auto_cookie
         
         # 创建工作目录
         self.work_path.mkdir(exist_ok=True)
+        
+        # 初始化Cookie管理器
+        if self.auto_cookie:
+            self.cookie_manager = CookieManager(str(self.work_path))
+            self.console.print("[blue]🍪 启用自动Cookie管理[/blue]")
+        else:
+            self.cookie_manager = None
         
         # 用户数据目录 - 用于保持登录状态
         self.user_data_dir = self.work_path / "browser_profile"
         if self.use_persistent_session:
             self.user_data_dir.mkdir(exist_ok=True)
             self.console.print(f"[blue]使用持久化浏览器配置: {self.user_data_dir}[/blue]")
+    
+    async def ensure_cookie(self) -> bool:
+        """确保有有效的Cookie"""
+        if not self.auto_cookie:
+            return bool(self.cookie)
+        
+        try:
+            # 使用Cookie管理器获取Cookie
+            cookie, is_new = await self.cookie_manager.get_cookie_automatically()
+            
+            if cookie:
+                self.cookie = cookie
+                if is_new:
+                    self.console.print("[green]✓ 自动获取Cookie成功[/green]")
+                else:
+                    self.console.print("[blue]✓ 使用缓存Cookie[/blue]")
+                return True
+            else:
+                self.console.print("[red]❌ 无法获取有效Cookie[/red]")
+                return False
+                
+        except Exception as e:
+            self.console.print(f"[red]Cookie获取失败: {e}[/red]")
+            return False
     
     def extract_note_id(self, url: str) -> Optional[str]:
         """从URL中提取笔记ID"""
@@ -72,6 +107,12 @@ class DynamicCommentExtractor:
         note_id = self.extract_note_id(note_url)
         if not note_id:
             return None
+            
+        # 获取笔记信息前检查Cookie
+        self.console.print("[blue]获取笔记信息前检查Cookie...[/blue]")
+        cookie_valid = await self.ensure_cookie()
+        if not cookie_valid:
+            self.console.print("[yellow]Cookie检查失败，将使用基础方式获取笔记信息[/yellow]")
             
         # 从浏览器中获取真实的笔记标题
         try:
@@ -230,6 +271,12 @@ class DynamicCommentExtractor:
     async def extract_comments_with_browser(self, note_url: str, note_id: str) -> List[Dict]:
         """使用浏览器自动化提取动态评论"""
         comments = []
+        
+        # 在开始浏览器操作前检查Cookie
+        self.console.print("[blue]浏览器启动前检查Cookie...[/blue]")
+        cookie_valid = await self.ensure_cookie()
+        if not cookie_valid:
+            self.console.print("[yellow]Cookie检查失败，将依赖持久化会话或手动登录[/yellow]")
         
         async with async_playwright() as p:
             # 准备浏览器启动参数
@@ -393,7 +440,7 @@ class DynamicCommentExtractor:
         """分页获取所有评论"""
         all_comments = []
         page_count = 0
-        max_pages = 20  # 最大页数限制，防止无限循环 (最多200条评论)
+        max_pages = 50  # 最大页数限制，防止无限循环 (最多500条评论)
         
         if self.max_comments:
             self.console.print(f"[blue]开始分页获取最新 {self.max_comments} 条评论...[/blue]")
@@ -1383,6 +1430,12 @@ IP位置: {ip_location}
                 self.console.print(f"[yellow]数量限制: 只获取最新 {self.max_comments} 条评论[/yellow]")
             else:
                 self.console.print("[blue]将获取所有可用评论[/blue]")
+            
+            # 检查并获取Cookie
+            self.console.print("[blue]检查Cookie状态...[/blue]")
+            cookie_valid = await self.ensure_cookie()
+            if not cookie_valid:
+                self.console.print("[yellow]Cookie无效，将尝试使用持久化会话登录[/yellow]")
             
             # 获取笔记信息
             note_info = await self.get_note_info_with_xhs(note_url)

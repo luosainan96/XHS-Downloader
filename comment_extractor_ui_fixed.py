@@ -5,7 +5,6 @@
 解决点击无反应的问题
 """
 
-import asyncio
 import streamlit as st
 import time
 from pathlib import Path
@@ -14,13 +13,64 @@ from datetime import datetime
 import threading
 import re
 import pandas as pd
+import asyncio
 
 from dynamic_comment_extractor import DynamicCommentExtractor
 from local_comment_loader import LocalCommentLoader
+from intelligent_reply_generator import create_intelligent_reply_generator
+from comment_selector import CommentSelector, SelectionCriteria, CommentPriority
+from comment_status_manager import CommentStatusManager, CommentStatus
 import aiohttp
 import aiofiles
 import hashlib
 import urllib.parse
+
+# 同步包装器函数
+def run_async_function(async_func, *args, **kwargs):
+    """在Streamlit中安全运行异步函数"""
+    try:
+        loop = asyncio.get_event_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+    
+    try:
+        return loop.run_until_complete(async_func(*args, **kwargs))
+    finally:
+        # 不要关闭事件循环，因为Streamlit可能还在使用它
+        pass
+
+def get_full_comment_data(comment_data: dict, work_dir: str) -> dict:
+    """获取完整的评论数据，包括原始数据文件中的详细信息"""
+    try:
+        # 如果comment_data已经包含完整信息，直接返回
+        if 'create_time' in comment_data and 'images' in comment_data:
+            return comment_data
+        
+        # 尝试从用户目录读取原始数据.json
+        user_nickname = comment_data.get('nickname', '')
+        if user_nickname and work_dir:
+            user_dir = Path(work_dir) / user_nickname
+            raw_data_file = user_dir / "原始数据.json"
+            
+            if raw_data_file.exists():
+                with open(raw_data_file, 'r', encoding='utf-8') as f:
+                    raw_data = json.load(f)
+                
+                # 合并数据
+                full_data = comment_data.copy()
+                full_data.update({
+                    'create_time': raw_data.get('create_time'),
+                    'images': raw_data.get('images', []),
+                    'user_info': raw_data.get('user_info', {}),
+                    'id': raw_data.get('id')
+                })
+                return full_data
+    except Exception as e:
+        print(f"获取完整评论数据失败: {e}")
+    
+    # 如果获取失败，返回原始数据
+    return comment_data
 
 # 页面配置
 st.set_page_config(
@@ -429,7 +479,7 @@ def main():
         """)
     
     # 主内容区域 - 使用选项卡组织内容
-    tab1, tab2, tab3, tab4 = st.tabs(["📝 输入链接", "📊 提取状态", "📋 评论详情", "📂 本地浏览"])
+    tab1, tab2, tab3, tab4, tab5 = st.tabs(["📝 输入链接", "📊 提取状态", "📋 评论详情", "📂 本地浏览", "🤖 智能回复"])
     
     with tab1:
         st.header("📝 作品链接输入")
@@ -1128,11 +1178,602 @@ def main():
                                             break
                                 else:
                                     st.write("无图片")
+                                
+                                # 添加跳转到作品评论区的按钮
+                                st.markdown("---")
+                                if st.button("🔗 去作品评论区回复", key=f"local_xiaohongshu_{comment['nickname']}_{comment['time']}"):
+                                    # 初始化状态管理器（如果还没有）
+                                    if 'local_status_manager' not in st.session_state:
+                                        st.session_state.local_status_manager = CommentStatusManager("Comments_Dynamic")
+                                    
+                                    local_status_manager = st.session_state.local_status_manager
+                                    
+                                    # 获取完整评论数据用于智能定位
+                                    full_comment_data = get_full_comment_data(comment, selected_work['work_dir'])
+                                    
+                                    work_url, location_guide = local_status_manager.generate_xiaohongshu_work_url(
+                                        selected_work['work_dir'], 
+                                        comment['nickname'],
+                                        full_comment_data
+                                    )
+                                    
+                                    if work_url:
+                                        # 显示智能定位信息
+                                        st.info(location_guide)
+                                        
+                                        # 跳转链接
+                                        st.markdown(f"[🚀 跳转到作品评论区]({work_url})")
+                                        
+                                        # 快速搜索指导
+                                        st.markdown("**💡 快速定位技巧：**")
+                                        st.markdown("1. 点击上方链接进入作品页面")
+                                        st.markdown("2. 滚动到评论区")
+                                        st.markdown("3. 使用 `Ctrl+F` (Windows) 或 `⌘+F` (Mac) 搜索关键词")
+                                        st.markdown("4. 根据时间和图片特征快速定位")
+                                        
+                                        # 显示完整评论内容
+                                        with st.expander("📖 完整评论内容", expanded=False):
+                                            st.write(comment['content'])
+                                    else:
+                                        st.error(f"❌ {location_guide}")
                 else:
                     st.info("🔍 没有找到匹配的评论，请尝试调整搜索条件")
         
         else:
             st.info("📂 暂无本地评论数据，请先在'📝 输入链接'选项卡中提取评论")
+    
+    with tab5:
+        st.header("🤖 AI智能回复助手")
+        
+        # 初始化智能回复组件
+        if 'reply_generator' not in st.session_state:
+            st.session_state.reply_generator = create_intelligent_reply_generator("mock_gpt4o")
+        
+        if 'comment_selector' not in st.session_state:
+            st.session_state.comment_selector = CommentSelector("Comments_Dynamic")
+            
+        if 'status_manager' not in st.session_state:
+            st.session_state.status_manager = CommentStatusManager("Comments_Dynamic")
+        
+        # 初始化选择的作品目录（确保统计数据准确）
+        if 'selected_work_dir' not in st.session_state:
+            st.session_state.selected_work_dir = None
+        
+        reply_generator = st.session_state.reply_generator
+        comment_selector = st.session_state.comment_selector
+        status_manager = st.session_state.status_manager
+        
+        st.markdown("""
+        ### 🏠 专业家居改造AI助手
+        
+        为您的评论提供专业的家居改造建议，包括：
+        - 🔍 **智能分析**：深度分析房屋现状和改造需求
+        - 🎨 **多风格方案**：现代简约、北欧自然、中式现代、工业复古
+        - 🖼️ **效果图生成**：AI生成改造后效果图和前后对比
+        - 💬 **智能回复**：生成专业、亲和的回复内容
+        """)
+        
+        # 显示整体统计面板
+        st.subheader("📊 整体统计概览")
+        
+        # 获取统计数据
+        model_stats = reply_generator.ai_manager.get_model_statistics()
+        daily_stats = reply_generator.get_daily_statistics()
+        
+        # 获取评论统计数据（如果已选择作品，使用作品统计；否则使用全局统计）
+        if 'selected_work_dir' in st.session_state and st.session_state.selected_work_dir:
+            comment_stats = status_manager.get_statistics(st.session_state.selected_work_dir)
+            # 显示当前统计范围
+            work_title = comment_stats.get('work_title', '未知作品')
+            st.info(f"📋 当前统计范围：《{work_title}》")
+        else:
+            comment_stats = status_manager.get_statistics()
+            st.info("📋 当前统计范围：全局数据（请先选择作品以查看具体统计）")
+        
+        # 第一行：AI模型和成本统计
+        col1, col2, col3, col4 = st.columns(4)
+        with col1:
+            st.metric("🤖 可用模型", len([m for m in model_stats.values() if m['enabled']]))
+        with col2:
+            st.metric("💰 今日成本", f"${daily_stats['cost_used']:.2f}")
+        with col3:
+            st.metric("📊 预算剩余", f"${daily_stats['budget_total'] - daily_stats['cost_used']:.2f}")
+        with col4:
+            completion_rate = comment_stats.get('completion_rate', 0)
+            st.metric("✅ 完成率", f"{completion_rate:.1f}%")
+        
+        # 第二行：评论和用户统计
+        col1, col2, col3, col4 = st.columns(4)
+        with col1:
+            st.metric("👥 用户数", comment_stats.get('unique_users', 0))
+        with col2:
+            st.metric("💬 评论总数", comment_stats.get('total_comments', 0))
+        with col3:
+            st.metric("✅ 已回复", comment_stats.get('completed_count', 0))
+        with col4:
+            st.metric("⏳ 待回复", comment_stats.get('pending_count', 0))
+        
+        # 状态分布饼图
+        if comment_stats.get('total_comments', 0) > 0:
+            col1, col2 = st.columns([2, 1])
+            with col1:
+                status_data = {
+                    '待处理': comment_stats.get('pending_count', 0),
+                    '观察中': comment_stats.get('watching_count', 0),
+                    '已完成': comment_stats.get('completed_count', 0)
+                }
+                
+                # 创建状态分布图表
+                try:
+                    import plotly.express as px
+                    if sum(status_data.values()) > 0:
+                        df = pd.DataFrame(list(status_data.items()), columns=['状态', '数量'])
+                        fig = px.pie(df, values='数量', names='状态', 
+                                   title='评论状态分布',
+                                   color_discrete_map={
+                                       '待处理': '#ff6b6b',
+                                       '观察中': '#feca57', 
+                                       '已完成': '#48dbfb'
+                                   })
+                        fig.update_layout(height=300)
+                        st.plotly_chart(fig, use_container_width=True)
+                except ImportError:
+                    # 如果没有plotly，使用简单的条形图
+                    st.bar_chart(status_data)
+            
+            with col2:
+                st.write("**📈 状态明细**")
+                for status, count in status_data.items():
+                    percentage = (count / comment_stats['total_comments']) * 100 if comment_stats['total_comments'] > 0 else 0
+                    st.write(f"- {status}: {count} 条 ({percentage:.1f}%)")
+                
+                # 显示标记状态说明（仅当选择了作品时）
+                if 'selected_work_dir' in st.session_state and st.session_state.selected_work_dir:
+                    st.markdown("---")
+                    st.write("**ℹ️ 统计说明**")
+                    marked_comments = comment_stats.get('marked_comments', 0)
+                    unmarked_comments = comment_stats.get('unmarked_comments', 0)
+                    st.write(f"- 已手动标记: {marked_comments} 条")
+                    st.write(f"- 未标记(默认待处理): {unmarked_comments} 条")
+                    st.caption("💡 未标记的评论会自动归类为'待处理'状态")
+        
+        st.markdown("---")
+        
+        # 作品选择
+        st.subheader("🎯 选择作品")
+        
+        # 获取可用作品
+        works = comment_selector.comment_loader.scan_available_works()
+        if not works:
+            st.warning("⚠️ 未找到本地评论数据，请先提取评论")
+            st.stop()
+        
+        # 作品选择下拉框
+        work_options = []
+        for work in works:
+            option_text = f"{work['work_title']} ({work['comment_count']} 条评论)"
+            work_options.append(option_text)
+        
+        selected_work_index = st.selectbox(
+            "选择要处理的作品",
+            range(len(works)),
+            format_func=lambda x: work_options[x],
+            key="ai_work_selector"
+        )
+        
+        if selected_work_index is not None:
+            selected_work = works[selected_work_index]
+            work_dir = selected_work['work_dir']
+            
+            # 保存当前选择的作品目录到session state，用于统计
+            st.session_state.selected_work_dir = work_dir
+            
+            # 确保评论状态记录存在
+            comment_selector.ensure_comment_status_exists(work_dir, selected_work['work_title'])
+            
+            st.markdown("---")
+            
+            # 评论筛选策略
+            st.subheader("🔍 评论筛选策略")
+            
+            col1, col2 = st.columns([2, 1])
+            with col1:
+                selection_criteria = st.multiselect(
+                    "选择筛选标准",
+                    [
+                        "改造需求优先",
+                        "有图评论优先", 
+                        "高互动潜力",
+                        "最新评论优先",
+                        "仅未处理评论",
+                        "待处理状态",
+                        "观察中状态",
+                        "已完成状态"
+                    ],
+                    default=["改造需求优先", "有图评论优先"],
+                    key="ai_criteria"
+                )
+            
+            with col2:
+                max_comments = st.number_input(
+                    "最大处理数量",
+                    min_value=1,
+                    max_value=50,
+                    value=10,
+                    key="ai_max_comments"
+                )
+            
+            # 转换选择标准
+            criteria_map = {
+                "改造需求优先": SelectionCriteria.RENOVATION_REQUESTS,
+                "有图评论优先": SelectionCriteria.IMAGE_CONSULTATIONS,
+                "高互动潜力": SelectionCriteria.HIGH_ENGAGEMENT,
+                "最新评论优先": SelectionCriteria.RECENT_COMMENTS,
+                "仅未处理评论": SelectionCriteria.UNPROCESSED_ONLY,
+                "待处理状态": SelectionCriteria.STATUS_PENDING,
+                "观察中状态": SelectionCriteria.STATUS_WATCHING,
+                "已完成状态": SelectionCriteria.STATUS_COMPLETED
+            }
+            
+            selected_criteria = [criteria_map[c] for c in selection_criteria if c in criteria_map]
+            
+            # 智能选择按钮
+            col1, col2, col3 = st.columns([1, 1, 2])
+            with col1:
+                if st.button("🔍 智能筛选", key="ai_smart_select"):
+                    with st.spinner("正在智能筛选评论..."):
+                        selection_batch = run_async_function(comment_selector.smart_auto_select,
+                            work_dir, 
+                            daily_budget=daily_stats['budget_remaining'],
+                            max_comments=max_comments
+                        )
+                        st.session_state.ai_selection_batch = selection_batch
+            
+            with col2:
+                if st.button("🎲 随机选择", key="ai_random_select"):
+                    if selected_criteria:
+                        with st.spinner("正在随机筛选评论..."):
+                            selection_batch = run_async_function(comment_selector.create_selection_batch,
+                                work_dir,
+                                selected_criteria,
+                                max_comments
+                            )
+                            st.session_state.ai_selection_batch = selection_batch
+                    else:
+                        st.warning("请先选择筛选标准")
+            
+            # 显示筛选结果
+            if 'ai_selection_batch' in st.session_state:
+                batch = st.session_state.ai_selection_batch
+                
+                st.markdown("---")
+                st.subheader("📋 筛选结果")
+                
+                # 显示筛选摘要
+                summary = batch['summary']
+                col1, col2, col3, col4 = st.columns(4)
+                with col1:
+                    st.metric("总筛选数", summary['total_selected'])
+                with col2:
+                    st.metric("高优先级", summary['high_priority_count'])
+                with col3:
+                    st.metric("预估成本", f"${summary['total_estimated_cost']}")
+                with col4:
+                    st.metric("有图评论", summary['images_available'])
+                
+                # 评论列表
+                st.subheader("🎯 候选评论")
+                
+                if batch['final_selections']:
+                    # 创建评论选择复选框
+                    selected_comments = []
+                    
+                    for i, item in enumerate(batch['final_selections']):
+                        comment_data = item['comment_data']
+                        analysis = item['analysis']
+                        
+                        with st.expander(
+                            f"{'🔥' if analysis['priority'] == 'high' else '⭐' if analysis['priority'] == 'medium' else '💡'} "
+                            f"{comment_data['nickname']} - 得分: {analysis['renovation_score']} - ${analysis['estimated_cost']}"
+                        ):
+                            col1, col2 = st.columns([3, 1])
+                            
+                            with col1:
+                                st.write(f"**评论内容：**")
+                                st.write(comment_data['content'])
+                                
+                                if comment_data.get('downloaded_images'):
+                                    st.write(f"**图片：** {len(comment_data['downloaded_images'])} 张")
+                                
+                                st.write(f"**关键词：** {', '.join(analysis['keywords_matched'][:5])}")
+                                st.write(f"**处理建议：** {analysis['processing_recommendation']}")
+                            
+                            with col2:
+                                # 状态管理按钮
+                                st.write("**状态管理：**")
+                                col2_1, col2_2, col2_3 = st.columns(3)
+                                
+                                user_nickname = comment_data['nickname']
+                                comment_content = comment_data['content']
+                                work_title = selected_work['work_title']
+                                
+                                with col2_1:
+                                    if st.button("⏳ 待处理", key=f"status_pending_{i}"):
+                                        status_manager.add_or_update_comment_status(
+                                            user_nickname=user_nickname,
+                                            work_title=work_title,
+                                            comment_content=comment_content,
+                                            status=CommentStatus.PENDING,
+                                            notes="手动标记为待处理",
+                                            operator="系统用户"
+                                        )
+                                        st.success("已标记为待处理")
+                                        st.rerun()
+                                
+                                with col2_2:
+                                    if st.button("👀 观察中", key=f"status_watching_{i}"):
+                                        status_manager.add_or_update_comment_status(
+                                            user_nickname=user_nickname,
+                                            work_title=work_title,
+                                            comment_content=comment_content,
+                                            status=CommentStatus.WATCHING,
+                                            notes="手动标记为观察中",
+                                            operator="系统用户"
+                                        )
+                                        st.success("已标记为观察中")
+                                        st.rerun()
+                                
+                                with col2_3:
+                                    if st.button("✅ 已完成", key=f"status_completed_{i}"):
+                                        status_manager.add_or_update_comment_status(
+                                            user_nickname=user_nickname,
+                                            work_title=work_title,
+                                            comment_content=comment_content,
+                                            status=CommentStatus.COMPLETED,
+                                            notes="手动标记为已完成",
+                                            operator="系统用户"
+                                        )
+                                        st.success("已标记为已完成")
+                                        st.rerun()
+                                
+                                # 小红书跳转按钮
+                                if st.button("🔗 去作品评论区回复", key=f"xiaohongshu_direct_{i}"):
+                                    # 尝试获取完整的评论数据用于智能定位
+                                    full_comment_data = get_full_comment_data(comment_data, work_dir)
+                                    
+                                    work_url, location_guide = status_manager.generate_xiaohongshu_work_url(
+                                        work_dir, user_nickname, full_comment_data
+                                    )
+                                    
+                                    if work_url:
+                                        # 显示智能定位信息
+                                        st.info(location_guide)
+                                        
+                                        # 跳转链接
+                                        st.markdown(f"[🚀 跳转到作品评论区]({work_url})")
+                                        
+                                        # 快速搜索指导
+                                        st.markdown("**💡 快速定位技巧：**")
+                                        st.markdown("1. 点击上方链接进入作品页面")
+                                        st.markdown("2. 滚动到评论区")
+                                        st.markdown("3. 使用 `Ctrl+F` (Windows) 或 `⌘+F` (Mac) 搜索关键词")
+                                        st.markdown("4. 根据时间和图片特征快速定位")
+                                        
+                                        # 显示完整评论内容
+                                        with st.expander("📖 完整评论内容", expanded=False):
+                                            st.write(comment_content)
+                                    else:
+                                        st.error(f"❌ {location_guide}")
+                                
+                                st.markdown("---")
+                                
+                                if st.checkbox(
+                                    f"选择处理",
+                                    key=f"select_comment_{i}",
+                                    value=analysis['priority'] == 'high'
+                                ):
+                                    selected_comments.append((comment_data, analysis))
+                    
+                    # 批量处理按钮
+                    if selected_comments:
+                        st.markdown("---")
+                        st.subheader("🚀 批量AI处理")
+                        
+                        col1, col2, col3 = st.columns([1, 1, 2])
+                        
+                        with col1:
+                            generate_images = st.checkbox("生成效果图", value=True, key="ai_generate_images")
+                        
+                        with col2:
+                            styles_to_generate = st.multiselect(
+                                "选择风格",
+                                ["现代简约", "北欧自然", "中式现代", "工业复古"],
+                                default=["现代简约", "北欧自然"],
+                                key="ai_styles"
+                            )
+                        
+                        total_cost = sum(analysis['estimated_cost'] for _, analysis in selected_comments)
+                        st.write(f"**总预估成本：** ${total_cost:.2f}")
+                        
+                        if st.button("🤖 开始AI处理", key="ai_start_processing"):
+                            if total_cost <= daily_stats['budget_remaining']:
+                                # 创建处理任务
+                                st.session_state.ai_processing_queue = selected_comments
+                                st.session_state.ai_processing_config = {
+                                    'generate_images': generate_images,
+                                    'styles': styles_to_generate
+                                }
+                                st.success(f"✅ 已加入处理队列：{len(selected_comments)} 条评论")
+                                st.rerun()
+                            else:
+                                st.error(f"❌ 预算不足！需要 ${total_cost:.2f}，剩余 ${daily_stats['budget_remaining']:.2f}")
+            
+            # 处理队列执行
+            if 'ai_processing_queue' in st.session_state and st.session_state.ai_processing_queue:
+                st.markdown("---")
+                st.subheader("⚡ AI处理进行中")
+                
+                processing_queue = st.session_state.ai_processing_queue
+                processing_config = st.session_state.ai_processing_config
+                
+                # 处理进度条
+                progress_bar = st.progress(0)
+                status_text = st.empty()
+                
+                # 处理结果容器
+                results_container = st.container()
+                
+                # 逐个处理评论
+                for i, (comment_data, analysis) in enumerate(processing_queue):
+                    try:
+                        # 更新进度
+                        progress = (i + 1) / len(processing_queue)
+                        progress_bar.progress(progress)
+                        status_text.text(f"正在处理第 {i+1}/{len(processing_queue)} 条评论...")
+                        
+                        # 处理单个评论
+                        with results_container:
+                            with st.expander(f"🔄 处理中：{comment_data['nickname']}", expanded=True):
+                                result_placeholder = st.empty()
+                                
+                                # 执行AI处理
+                                processing_result = run_async_function(reply_generator.process_renovation_request,
+                                    comment_data,
+                                    generate_images=processing_config['generate_images'],
+                                    styles_to_generate=processing_config['styles']
+                                )
+                                
+                                if processing_result['success']:
+                                    # 显示处理结果
+                                    result_placeholder.success(f"✅ 处理完成！成本：${processing_result['total_cost']:.4f}")
+                                    
+                                    # 显示分析结果
+                                    if 'analysis' in processing_result['processing_stages']:
+                                        st.write("**🔍 房屋分析：**")
+                                        st.write(processing_result['processing_stages']['analysis']['analysis'][:300] + "...")
+                                    
+                                    # 显示改造方案
+                                    if 'renovation_planning' in processing_result['processing_stages']:
+                                        st.write("**🏗️ 改造方案：**")
+                                        st.write(processing_result['processing_stages']['renovation_planning']['renovation_plans'][:300] + "...")
+                                    
+                                    # 显示生成的图片
+                                    if processing_config['generate_images']:
+                                        generated_images = processing_result['processing_stages'].get('image_generation', [])
+                                        successful_images = [img for img in generated_images if img.get('success')]
+                                        if successful_images:
+                                            st.write(f"**🎨 生成效果图：** {len(successful_images)} 张")
+                                    
+                                    # 显示智能回复
+                                    if 'reply_generation' in processing_result['processing_stages']:
+                                        reply_result = processing_result['processing_stages']['reply_generation']
+                                        if reply_result['success']:
+                                            st.write("**💬 智能回复选项：**")
+                                            
+                                            # 创建回复选项的标签页
+                                            reply_tabs = st.tabs(["详细专业版", "简洁实用版", "互动引导版"])
+                                            
+                                            replies = reply_result['replies'].split('## 版本')[1:]  # 分割不同版本
+                                            for j, reply_content in enumerate(replies[:3]):
+                                                with reply_tabs[j]:
+                                                    st.text_area(
+                                                        f"回复内容",
+                                                        value=reply_content.strip(),
+                                                        height=150,
+                                                        key=f"reply_{i}_{j}"
+                                                    )
+                                                    
+                                                    col_copy, col_xiaohongshu = st.columns(2)
+                                                    with col_copy:
+                                                        if st.button(f"📋 复制回复", key=f"copy_reply_{i}_{j}"):
+                                                            # TODO: 实现复制到剪贴板功能
+                                                            st.success("回复内容已准备，可手动复制")
+                                                    
+                                                    with col_xiaohongshu:
+                                                        if st.button(f"🔗 去作品评论区回复", key=f"xiaohongshu_find_{i}_{j}"):
+                                                            # 生成小红书作品评论区URL
+                                                            user_nickname = comment_data['nickname']
+                                                            work_url, location_guide = status_manager.generate_xiaohongshu_work_url(
+                                                                work_dir, user_nickname, comment_data
+                                                            )
+                                                            
+                                                            if work_url:
+                                                                # 标记评论状态为已完成（用户手动回复）
+                                                                status_manager.add_or_update_comment_status(
+                                                                    user_nickname=user_nickname,
+                                                                    work_title=selected_work['work_title'],
+                                                                    comment_content=comment_data['content'],
+                                                                    status=CommentStatus.COMPLETED,
+                                                                    notes=f"用户通过小红书手动回复 - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+                                                                    operator="系统用户",
+                                                                    reply_content=reply_content.strip()[:100] + "...",
+                                                                    xiaohongshu_url=work_url
+                                                                )
+                                                                
+                                                                # 显示智能定位信息
+                                                                st.success("✅ 评论状态已标记为已完成")
+                                                                
+                                                                # 显示详细的定位指导
+                                                                st.info(location_guide)
+                                                                
+                                                                # 跳转链接
+                                                                st.markdown(f"[🚀 跳转到作品评论区]({work_url})")
+                                                                
+                                                                # 快速搜索指导
+                                                                st.markdown("**💡 快速定位技巧：**")
+                                                                st.markdown("1. 点击上方链接进入作品页面")
+                                                                st.markdown("2. 滚动到评论区")
+                                                                st.markdown("3. 使用 `Ctrl+F` (Windows) 或 `⌘+F` (Mac) 搜索关键词")
+                                                                st.markdown("4. 根据时间和图片特征快速定位")
+                                                                
+                                                                # 显示完整评论内容
+                                                                with st.expander("📖 完整评论内容", expanded=False):
+                                                                    st.write(comment_data['content'])
+                                                            else:
+                                                                st.error(f"❌ {location_guide}")
+                                else:
+                                    result_placeholder.error(f"❌ 处理失败：{processing_result.get('error', '未知错误')}")
+                                
+                    except Exception as e:
+                        st.error(f"处理评论时发生异常：{str(e)}")
+                
+                # 处理完成
+                progress_bar.progress(1.0)
+                status_text.text("✅ 全部处理完成！")
+                
+                # 清理处理队列
+                del st.session_state.ai_processing_queue
+                del st.session_state.ai_processing_config
+                
+                # 更新统计信息
+                updated_stats = reply_generator.get_daily_statistics()
+                st.success(f"🎉 批量处理完成！今日已使用预算：${updated_stats['cost_used']:.2f}")
+        
+        # 处理历史
+        st.markdown("---")
+        st.subheader("📚 处理历史")
+        
+        col1, col2 = st.columns([1, 1])
+        with col1:
+            if st.button("🔄 刷新历史", key="ai_refresh_history"):
+                st.rerun()
+        
+        with col2:
+            history_limit = st.number_input("显示数量", min_value=5, max_value=100, value=20, key="ai_history_limit")
+        
+        # 显示选择历史
+        selection_history = comment_selector.get_selection_history(history_limit)
+        if selection_history:
+            st.write("**📋 选择历史**")
+            history_df = pd.DataFrame(selection_history)
+            st.dataframe(history_df, use_container_width=True)
+        
+        # 显示处理历史
+        processing_history = reply_generator.get_processing_history(history_limit)
+        if processing_history:
+            st.write("**🤖 处理历史**")
+            processing_df = pd.DataFrame(processing_history)
+            st.dataframe(processing_df, use_container_width=True)
     
     # 结果显示
     if st.session_state.results:
